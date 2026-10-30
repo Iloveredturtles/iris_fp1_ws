@@ -1,0 +1,16 @@
+# colcon
+build/
+install/
+log/
+
+# compiled test binary
+/tmp/iris_fp_tests
+
+# editor
+.vscode/
+*.swp
+*~
+
+# python
+__pycache__/
+*.pyc
