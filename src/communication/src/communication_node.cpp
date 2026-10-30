@@ -1,17 +1,12 @@
-// communication_node.cpp — the only node that touches the UDP socket.
+// communication_node.cpp
+// the only node that touches the UDP socket
 //
-// Objectives 1 and 2 of the final project live here: send drive commands to
-// the simulator, and read its feedback back into ROS.
+// listens on  /cmd_drive     (Twist: linear.x = motor pwm, angular.z = steering deg)
+// publishes   /car_feedback  (Int32MultiArray: left ticks, right ticks, fwd cm/s, side cm/s)
 //
-//   subscribes : /cmd_drive     geometry_msgs/Twist
-//                                 linear.x  = motor PWM   (-255 .. 255)
-//                                 angular.z = steering    ( -90 ..  90 deg)
-//   publishes  : /car_feedback  std_msgs/Int32MultiArray
-//                                 [left_ticks, right_ticks, vel_x_cms, vel_y_cms]
-//
-// Why one socket node instead of letting every node send its own packets:
-// two nodes writing to the same port fight each other, and the car twitches.
-// Everything funnels through /cmd_drive so there is exactly one writer.
+// everything that wants to drive the car publishes /cmd_drive instead of
+// opening its own socket. two nodes writing to the same port interleave their
+// packets and the car twitches, which looks like a control bug but isnt
 
 #include "communication/udp_protocol.hpp"
 
@@ -26,199 +21,195 @@
 #include <unistd.h>
 
 #include <atomic>
-#include <cerrno>
 #include <cmath>
 #include <cstring>
-#include <memory>
 #include <string>
 #include <thread>
-
-namespace {
 
 using communication::DriveCommand;
 using communication::Feedback;
 
 class CommunicationNode : public rclcpp::Node {
- public:
-  CommunicationNode() : rclcpp::Node("communication_node") {
-    remote_host_ = declare_parameter<std::string>("remote_host", "127.0.0.1");
-    send_port_ = declare_parameter<int>("send_port", 12151);
-    recv_port_ = declare_parameter<int>("recv_port", 12152);
-    rate_hz_ = declare_parameter<double>("rate_hz", 20.0);
-    command_timeout_s_ = declare_parameter<double>("command_timeout_s", 0.5);
+public:
+    CommunicationNode() : rclcpp::Node("communication_node") {
+        car_ip_         = declare_parameter<std::string>("remote_host", "127.0.0.1");
+        port_to_car_    = declare_parameter<int>("send_port", 12151);
+        port_from_car_  = declare_parameter<int>("recv_port", 12152);
+        send_rate_hz_   = declare_parameter<double>("rate_hz", 20.0);
+        command_timeout_sec_ = declare_parameter<double>("command_timeout_s", 0.5);
 
-    if (!openSockets()) {
-      throw std::runtime_error("could not open UDP sockets");
+        if (!open_sockets()) {
+            throw std::runtime_error("could not open the UDP sockets");
+        }
+
+        command_sub_ = create_subscription<geometry_msgs::msg::Twist>(
+            "/cmd_drive", 10,
+            [this](geometry_msgs::msg::Twist::ConstSharedPtr msg) {
+                latest_command_.motor_pwm    = (int)lround(msg->linear.x);
+                latest_command_.steering_deg = (int)lround(msg->angular.z);
+                last_command_time_ = now();
+                got_a_command_ = true;
+            });
+
+        feedback_pub_ = create_publisher<std_msgs::msg::Int32MultiArray>("/car_feedback", 10);
+
+        auto period = std::chrono::duration<double>(1.0 / send_rate_hz_);
+        send_timer_ = create_wall_timer(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(period),
+            [this] { send_command_to_car(); });
+
+        receiver_running_ = true;
+        receiver_thread_ = std::thread([this] { receive_from_car_loop(); });
+
+        RCLCPP_INFO(get_logger(), "sending to %s:%d, listening on :%d, %.1f Hz",
+                    car_ip_.c_str(), port_to_car_, port_from_car_, send_rate_hz_);
     }
 
-    command_sub_ = create_subscription<geometry_msgs::msg::Twist>(
-        "/cmd_drive", 10,
-        [this](geometry_msgs::msg::Twist::ConstSharedPtr msg) { onCommand(*msg); });
-
-    feedback_pub_ = create_publisher<std_msgs::msg::Int32MultiArray>("/car_feedback", 10);
-
-    const auto period = std::chrono::duration<double>(1.0 / rate_hz_);
-    send_timer_ = create_wall_timer(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(period), [this] { sendTick(); });
-
-    running_ = true;
-    receiver_ = std::thread([this] { receiveLoop(); });
-
-    RCLCPP_INFO(get_logger(), "sending to %s:%d, listening on :%d, %.1f Hz",
-                remote_host_.c_str(), send_port_, recv_port_, rate_hz_);
-  }
-
-  ~CommunicationNode() override {
-    // Order matters. Flip the flag, then close the socket so a blocked
-    // recvfrom() returns immediately, then join. Joining first would hang
-    // for up to one socket timeout.
-    running_ = false;
-    if (recv_fd_ >= 0) {
-      ::shutdown(recv_fd_, SHUT_RDWR);
-      ::close(recv_fd_);
-      recv_fd_ = -1;
-    }
-    if (receiver_.joinable()) {
-      receiver_.join();
-    }
-    if (send_fd_ >= 0) {
-      ::close(send_fd_);
-      send_fd_ = -1;
-    }
-  }
-
- private:
-  bool openSockets() {
-    send_fd_ = ::socket(AF_INET, SOCK_DGRAM, 0);
-    if (send_fd_ < 0) {
-      RCLCPP_ERROR(get_logger(), "send socket: %s", std::strerror(errno));
-      return false;
+    ~CommunicationNode() override {
+        // order matters here. clear the flag, close the socket so a blocked
+        // recvfrom wakes up, then join. joining first would hang
+        receiver_running_ = false;
+        if (socket_from_car_ >= 0) {
+            shutdown(socket_from_car_, SHUT_RDWR);
+            close(socket_from_car_);
+            socket_from_car_ = -1;
+        }
+        if (receiver_thread_.joinable()) receiver_thread_.join();
+        if (socket_to_car_ >= 0) {
+            close(socket_to_car_);
+            socket_to_car_ = -1;
+        }
     }
 
-    std::memset(&send_addr_, 0, sizeof(send_addr_));
-    send_addr_.sin_family = AF_INET;
-    send_addr_.sin_port = htons(static_cast<uint16_t>(send_port_));
-    if (::inet_pton(AF_INET, remote_host_.c_str(), &send_addr_.sin_addr) != 1) {
-      RCLCPP_ERROR(get_logger(), "bad remote_host: %s", remote_host_.c_str());
-      return false;
+private:
+    bool open_sockets() {
+        socket_to_car_ = socket(AF_INET, SOCK_DGRAM, 0);
+        if (socket_to_car_ < 0) {
+            RCLCPP_ERROR(get_logger(), "send socket failed: %s", strerror(errno));
+            return false;
+        }
+
+        memset(&car_address_, 0, sizeof(car_address_));
+        car_address_.sin_family = AF_INET;
+        car_address_.sin_port = htons((uint16_t)port_to_car_);
+        if (inet_pton(AF_INET, car_ip_.c_str(), &car_address_.sin_addr) != 1) {
+            RCLCPP_ERROR(get_logger(), "bad remote_host: %s", car_ip_.c_str());
+            return false;
+        }
+
+        socket_from_car_ = socket(AF_INET, SOCK_DGRAM, 0);
+        if (socket_from_car_ < 0) {
+            RCLCPP_ERROR(get_logger(), "receive socket failed: %s", strerror(errno));
+            return false;
+        }
+
+        int reuse = 1;
+        setsockopt(socket_from_car_, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+
+        // give the read a timeout so the thread cant block forever on shutdown
+        timeval read_timeout;
+        read_timeout.tv_sec = 0;
+        read_timeout.tv_usec = 200000;   // 200 ms
+        setsockopt(socket_from_car_, SOL_SOCKET, SO_RCVTIMEO,
+                   &read_timeout, sizeof(read_timeout));
+
+        sockaddr_in listen_address;
+        memset(&listen_address, 0, sizeof(listen_address));
+        listen_address.sin_family = AF_INET;
+        listen_address.sin_addr.s_addr = htonl(INADDR_ANY);
+        listen_address.sin_port = htons((uint16_t)port_from_car_);
+
+        if (bind(socket_from_car_, (sockaddr*)&listen_address, sizeof(listen_address)) < 0) {
+            RCLCPP_ERROR(get_logger(), "could not bind port %d: %s",
+                         port_from_car_, strerror(errno));
+            return false;
+        }
+        return true;
     }
 
-    recv_fd_ = ::socket(AF_INET, SOCK_DGRAM, 0);
-    if (recv_fd_ < 0) {
-      RCLCPP_ERROR(get_logger(), "recv socket: %s", std::strerror(errno));
-      return false;
+    void send_command_to_car() {
+        DriveCommand command_to_send = latest_command_;
+
+        // if whoever was driving has gone quiet, stop the motor. we leave the
+        // steering where it was on purpose, because centring the wheels at the
+        // same moment the motor cuts makes the car lurch sideways
+        if (got_a_command_ &&
+            (now() - last_command_time_).seconds() > command_timeout_sec_) {
+            command_to_send.motor_pwm = 0;
+            if (!already_warned_about_timeout_) {
+                RCLCPP_WARN(get_logger(), "no /cmd_drive for %.1fs, motor held at zero",
+                            command_timeout_sec_);
+                already_warned_about_timeout_ = true;
+            }
+        } else if (got_a_command_) {
+            already_warned_about_timeout_ = false;
+        }
+
+        unsigned char packet[communication::COMMAND_PACKET_BYTES];
+        communication::build_command(packet, command_to_send);
+
+        ssize_t bytes_sent = sendto(socket_to_car_, packet, sizeof(packet), 0,
+                                    (const sockaddr*)&car_address_, sizeof(car_address_));
+        if (bytes_sent < 0) {
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                                 "sendto failed: %s", strerror(errno));
+        }
     }
 
-    int reuse = 1;
-    ::setsockopt(recv_fd_, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    void receive_from_car_loop() {
+        unsigned char packet[64];
+        Feedback feedback;
 
-    // Without a read timeout the receive thread blocks forever and shutdown
-    // relies entirely on close(). The timeout is belt and braces.
-    timeval tv{};
-    tv.tv_sec = 0;
-    tv.tv_usec = 200000;  // 200 ms
-    ::setsockopt(recv_fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        while (receiver_running_) {
+            ssize_t bytes_read = recvfrom(socket_from_car_, packet, sizeof(packet),
+                                          0, nullptr, nullptr);
+            if (bytes_read <= 0) continue;   // timed out, or we are shutting down
 
-    sockaddr_in bind_addr{};
-    bind_addr.sin_family = AF_INET;
-    bind_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    bind_addr.sin_port = htons(static_cast<uint16_t>(recv_port_));
-    if (::bind(recv_fd_, reinterpret_cast<sockaddr*>(&bind_addr), sizeof(bind_addr)) < 0) {
-      RCLCPP_ERROR(get_logger(), "bind :%d failed: %s", recv_port_, std::strerror(errno));
-      return false;
-    }
-    return true;
-  }
+            if (!communication::parse_feedback(packet, (int)bytes_read, feedback)) {
+                continue;   // not one of ours
+            }
 
-  void onCommand(const geometry_msgs::msg::Twist& msg) {
-    command_.motor_pwm = static_cast<int32_t>(std::lround(msg.linear.x));
-    command_.steering_deg = static_cast<int32_t>(std::lround(msg.angular.z));
-    last_command_time_ = now();
-    have_command_ = true;
-  }
-
-  void sendTick() {
-    DriveCommand outgoing = command_;
-
-    // If the controller died or the teleop was closed, stop driving. Steering
-    // is deliberately left where it was: centring the wheels at the same
-    // moment the motor cuts makes the car lurch sideways on the simulator.
-    if (have_command_ && (now() - last_command_time_).seconds() > command_timeout_s_) {
-      outgoing.motor_pwm = 0;
-      if (!timeout_warned_) {
-        RCLCPP_WARN(get_logger(), "no /cmd_drive for %.1fs, holding motor at zero",
-                    command_timeout_s_);
-        timeout_warned_ = true;
-      }
-    } else if (have_command_) {
-      timeout_warned_ = false;
+            std_msgs::msg::Int32MultiArray message;
+            message.data = {feedback.left_wheel_ticks,
+                            feedback.right_wheel_ticks,
+                            feedback.forward_speed_cms,
+                            feedback.sideways_speed_cms};
+            feedback_pub_->publish(message);
+        }
     }
 
-    unsigned char buf[communication::kCommandPacketSize];
-    const std::size_t len = communication::buildCommandPacket(buf, outgoing);
+    std::string car_ip_;
+    int port_to_car_ = 0;
+    int port_from_car_ = 0;
+    double send_rate_hz_ = 20.0;
+    double command_timeout_sec_ = 0.5;
 
-    const ssize_t sent = ::sendto(send_fd_, buf, len, 0,
-                                  reinterpret_cast<const sockaddr*>(&send_addr_),
-                                  sizeof(send_addr_));
-    if (sent < 0) {
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "sendto: %s",
-                           std::strerror(errno));
-    }
-  }
+    int socket_to_car_ = -1;
+    int socket_from_car_ = -1;
+    sockaddr_in car_address_;
 
-  void receiveLoop() {
-    unsigned char buf[64];
-    Feedback fb;
+    DriveCommand latest_command_;
+    rclcpp::Time last_command_time_;
+    bool got_a_command_ = false;
+    bool already_warned_about_timeout_ = false;
 
-    while (running_) {
-      const ssize_t len = ::recvfrom(recv_fd_, buf, sizeof(buf), 0, nullptr, nullptr);
-      if (len <= 0) {
-        continue;  // timeout, or the socket was closed on shutdown
-      }
-      if (!communication::parseFeedbackPacket(buf, static_cast<std::size_t>(len), fb)) {
-        continue;  // not ours
-      }
+    std::atomic<bool> receiver_running_{false};
+    std::thread receiver_thread_;
 
-      std_msgs::msg::Int32MultiArray msg;
-      msg.data = {fb.left_ticks, fb.right_ticks, fb.vel_x_cms, fb.vel_y_cms};
-      feedback_pub_->publish(msg);
-    }
-  }
-
-  std::string remote_host_;
-  int send_port_ = 0;
-  int recv_port_ = 0;
-  double rate_hz_ = 20.0;
-  double command_timeout_s_ = 0.5;
-
-  int send_fd_ = -1;
-  int recv_fd_ = -1;
-  sockaddr_in send_addr_{};
-
-  DriveCommand command_{};
-  rclcpp::Time last_command_time_;
-  bool have_command_ = false;
-  bool timeout_warned_ = false;
-
-  std::atomic<bool> running_{false};
-  std::thread receiver_;
-
-  rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr command_sub_;
-  rclcpp::Publisher<std_msgs::msg::Int32MultiArray>::SharedPtr feedback_pub_;
-  rclcpp::TimerBase::SharedPtr send_timer_;
+    rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr command_sub_;
+    rclcpp::Publisher<std_msgs::msg::Int32MultiArray>::SharedPtr feedback_pub_;
+    rclcpp::TimerBase::SharedPtr send_timer_;
 };
 
-}  // namespace
-
 int main(int argc, char** argv) {
-  rclcpp::init(argc, argv);
-  try {
-    rclcpp::spin(std::make_shared<CommunicationNode>());
-  } catch (const std::exception& e) {
-    RCLCPP_FATAL(rclcpp::get_logger("communication_node"), "%s", e.what());
+    rclcpp::init(argc, argv);
+    try {
+        rclcpp::spin(std::make_shared<CommunicationNode>());
+    } catch (const std::exception& e) {
+        RCLCPP_FATAL(rclcpp::get_logger("communication_node"), "%s", e.what());
+        rclcpp::shutdown();
+        return 1;
+    }
     rclcpp::shutdown();
-    return 1;
-  }
-  rclcpp::shutdown();
-  return 0;
+    return 0;
 }

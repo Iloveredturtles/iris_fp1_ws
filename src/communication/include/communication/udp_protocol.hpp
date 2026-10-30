@@ -1,99 +1,77 @@
-// udp_protocol.hpp — wire format for talking to the simulator over UDP.
-//
-// Header-only and free of ROS, so it can be unit tested with plain g++.
-//
-// Packet layout (little endian, which is what x86 already uses natively):
-//
-//   command  (ROS -> sim)   12 bytes : "IRIS" | motor_pwm | steering_deg
-//   feedback (sim -> ROS)   20 bytes : "IRIS" | left_ticks | right_ticks
-//                                             | vel_x_cms  | vel_y_cms
-//
-// VERIFY THESE AGAINST THE MODULE before trusting them. If the byte layout is
-// wrong, nothing downstream works and the failure looks like "the car ignores
-// me", which is miserable to debug.
+// udp_protocol.hpp
+// how we pack and unpack the bytes we send to the car
 
-#ifndef COMMUNICATION_UDP_PROTOCOL_HPP
-#define COMMUNICATION_UDP_PROTOCOL_HPP
+#ifndef UDP_PROTOCOL_HPP
+#define UDP_PROTOCOL_HPP
 
-#include <algorithm>
-#include <cstddef>
 #include <cstdint>
 #include <cstring>
-
-#if defined(__linux__)
 #include <endian.h>
-#else
-#define htole32(x) (x)
-#define le32toh(x) (x)
-#endif
 
 namespace communication {
 
-inline constexpr char kHeader[4] = {'I', 'R', 'I', 'S'};
-inline constexpr std::size_t kHeaderSize = 4;
+// every packet starts with this so we can ignore junk arriving on the port
+const char PACKET_HEADER[4] = {'I', 'R', 'I', 'S'};
+const int HEADER_BYTES = 4;
 
-inline constexpr std::size_t kCommandPacketSize = kHeaderSize + 2 * sizeof(int32_t);   // 12
-inline constexpr std::size_t kFeedbackPacketSize = kHeaderSize + 4 * sizeof(int32_t);  // 20
+const int COMMAND_PACKET_BYTES  = 12;   // header + motor + steering
+const int FEEDBACK_PACKET_BYTES = 20;   // header + 4 numbers
 
-// The simulator ignores values outside these, so clamp before sending rather
-// than letting a runaway controller push nonsense onto the wire.
-inline constexpr int32_t kPwmLimit = 255;
-inline constexpr int32_t kSteerLimitDeg = 90;
+const int MAX_MOTOR_PWM   = 255;
+const int MAX_STEERING_DEG = 90;
 
+// what we send to the car
 struct DriveCommand {
-  int32_t motor_pwm = 0;     // -255 .. +255, sign = direction
-  int32_t steering_deg = 0;  //  -90 ..  +90, sign = left/right
+    int motor_pwm = 0;      // -255 back, +255 forward
+    int steering_deg = 0;   // -90 right, +90 left
 };
 
+// what the car sends back
 struct Feedback {
-  int32_t left_ticks = 0;
-  int32_t right_ticks = 0;
-  int32_t vel_x_cms = 0;
-  int32_t vel_y_cms = 0;
+    int left_wheel_ticks = 0;
+    int right_wheel_ticks = 0;
+    int forward_speed_cms = 0;
+    int sideways_speed_cms = 0;
 };
 
-inline int32_t clampInt(int32_t value, int32_t lo, int32_t hi) {
-  return std::max(lo, std::min(hi, value));
+inline int clamp_int(int value, int lowest, int highest) {
+    if (value < lowest)  return lowest;
+    if (value > highest) return highest;
+    return value;
 }
 
-// memcpy rather than a cast: a reinterpret_cast to int32_t* on an unaligned
-// byte buffer is undefined behaviour, and the optimiser is allowed to assume
-// it never happens.
-inline void putInt32(unsigned char* dst, int32_t value) {
-  const uint32_t le = htole32(static_cast<uint32_t>(value));
-  std::memcpy(dst, &le, sizeof(le));
+// write one 4 byte number into the buffer
+inline void put_int(unsigned char* buffer, int value) {
+    uint32_t little_endian = htole32((uint32_t)value);
+    memcpy(buffer, &little_endian, 4);
 }
 
-inline int32_t getInt32(const unsigned char* src) {
-  uint32_t le = 0;
-  std::memcpy(&le, src, sizeof(le));
-  return static_cast<int32_t>(le32toh(le));
+// read one 4 byte number back out
+inline int get_int(const unsigned char* buffer) {
+    uint32_t little_endian = 0;
+    memcpy(&little_endian, buffer, 4);
+    return (int)le32toh(little_endian);
 }
 
-// Writes exactly kCommandPacketSize bytes into buf and returns that count.
-inline std::size_t buildCommandPacket(unsigned char* buf, const DriveCommand& cmd) {
-  std::memcpy(buf, kHeader, kHeaderSize);
-  putInt32(buf + kHeaderSize + 0, clampInt(cmd.motor_pwm, -kPwmLimit, kPwmLimit));
-  putInt32(buf + kHeaderSize + 4, clampInt(cmd.steering_deg, -kSteerLimitDeg, kSteerLimitDeg));
-  return kCommandPacketSize;
+// build the 12 byte packet we send every tick
+inline void build_command(unsigned char* buffer, const DriveCommand& command) {
+    memcpy(buffer, PACKET_HEADER, HEADER_BYTES);
+    put_int(buffer + 4, clamp_int(command.motor_pwm, -MAX_MOTOR_PWM, MAX_MOTOR_PWM));
+    put_int(buffer + 8, clamp_int(command.steering_deg, -MAX_STEERING_DEG, MAX_STEERING_DEG));
 }
 
-// False means "not a packet for us" — short, or the header did not match.
-// Dropping silently is correct here: UDP lets anything arrive on the port.
-inline bool parseFeedbackPacket(const unsigned char* buf, std::size_t len, Feedback& out) {
-  if (len < kFeedbackPacketSize) {
-    return false;
-  }
-  if (std::memcmp(buf, kHeader, kHeaderSize) != 0) {
-    return false;
-  }
-  out.left_ticks = getInt32(buf + 4);
-  out.right_ticks = getInt32(buf + 8);
-  out.vel_x_cms = getInt32(buf + 12);
-  out.vel_y_cms = getInt32(buf + 16);
-  return true;
+// false means the packet is too short or not ours, so just drop it
+inline bool parse_feedback(const unsigned char* buffer, int length, Feedback& out) {
+    if (length < FEEDBACK_PACKET_BYTES) return false;
+    if (memcmp(buffer, PACKET_HEADER, HEADER_BYTES) != 0) return false;
+
+    out.left_wheel_ticks    = get_int(buffer + 4);
+    out.right_wheel_ticks   = get_int(buffer + 8);
+    out.forward_speed_cms   = get_int(buffer + 12);
+    out.sideways_speed_cms  = get_int(buffer + 16);
+    return true;
 }
 
 }  // namespace communication
 
-#endif  // COMMUNICATION_UDP_PROTOCOL_HPP
+#endif

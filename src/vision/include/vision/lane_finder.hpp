@@ -1,27 +1,20 @@
-// lane_finder.hpp — objectives 5 and 6: find the road and say which way to turn.
+// lane_finder.hpp
+// finds the road markings in a camera frame and says how far off centre we are
 //
-// Header-only and ROS-free so it can be tested against synthetic images with
-// plain g++ and OpenCV. The node is a thin wrapper around this.
+// the steps are:
+//   1. threshold in HLS            -> white pixels where the markings are
+//   2. warp to a birds eye view    -> markings become roughly vertical stripes
+//   3. count white pixels per column in a band ahead of the car
+//   4. group neighbouring columns into runs, one run per marking
+//   5. work out the lane centre from those runs
 //
-// Pipeline:
-//   1. threshold in HLS            -> binary mask of the lane markings
-//   2. perspective warp            -> bird's eye view, where a lane is two
-//                                     roughly vertical stripes a fixed
-//                                     distance apart
-//   3. column profile in a band    -> where the markings are, left to right
-//   4. group columns into runs     -> one run per marking
-//   5. decide the lane centre      -> lateral error in -1 .. +1
-//
-// Step 4 is the part worth caring about. The obvious implementation — average
-// every lit pixel in the band — is wrong, and wrong in a way that passes a
-// casual eye test. When one of the two markings leaves the frame on a bend,
-// the average collapses onto the marking that is left, so the car is told it
-// is perfectly centred at the exact moment it is about to leave the road.
-// Clustering into runs and remembering the lane width fixes it: one visible
-// marking plus a known width still gives a centre.
+// step 4 is the one that matters. the obvious version is to average every
+// white pixel in the band, but that breaks on a bend: when one marking leaves
+// the frame the average slides onto the marking that is left, so the car is
+// told it is centred right when it is about to drive off the road
 
-#ifndef VISION_LANE_FINDER_HPP
-#define VISION_LANE_FINDER_HPP
+#ifndef LANE_FINDER_HPP
+#define LANE_FINDER_HPP
 
 #include <opencv2/opencv.hpp>
 
@@ -32,353 +25,369 @@
 namespace vision {
 
 enum class LaneSource {
-  kNone,       // nothing bright enough in the band
-  kTwoLines,   // both markings visible — the good case
-  kOneLine,    // one marking plus a remembered lane width
-  kSurface,    // one very wide blob, treated as the road surface
-  kAmbiguous,  // one marking and no history, so no way to know which side
+    NOTHING_FOUND,   // no bright pixels at all
+    BOTH_MARKINGS,   // found both sides, the good case
+    ONE_MARKING,     // one side plus the lane width we remembered
+    ROAD_SURFACE,    // one wide blob, so the road itself not a marking
+    CANT_TELL        // one side and no memory, so we refuse to guess
 };
 
-inline const char* toString(LaneSource s) {
-  switch (s) {
-    case LaneSource::kNone: return "none";
-    case LaneSource::kTwoLines: return "two-lines";
-    case LaneSource::kOneLine: return "one-line";
-    case LaneSource::kSurface: return "surface";
-    case LaneSource::kAmbiguous: return "ambiguous";
-  }
-  return "?";
+inline const char* lane_source_name(LaneSource source) {
+    switch (source) {
+        case LaneSource::NOTHING_FOUND: return "nothing";
+        case LaneSource::BOTH_MARKINGS: return "both markings";
+        case LaneSource::ONE_MARKING:   return "one marking";
+        case LaneSource::ROAD_SURFACE:  return "road surface";
+        case LaneSource::CANT_TELL:     return "cant tell";
+    }
+    return "?";
 }
 
-struct LaneParams {
-  // --- marking threshold, HLS ---------------------------------------------
-  // White paint on asphalt is bright and nearly colourless, so a high L with
-  // a low S ceiling picks it out and ignores coloured scenery.
-  int l_min = 170;
-  int s_max = 90;
-  int morph_open = 2;  // kills single-pixel speckle before clustering
+struct LaneSettings {
+    // --- picking out the markings ---
+    // road paint is bright and has almost no colour, so a high lightness floor
+    // with a low saturation ceiling catches it and ignores coloured scenery
+    int min_lightness = 170;
+    int max_saturation = 90;
+    int despeckle_passes = 2;
 
-  // --- bird's eye view ----------------------------------------------------
-  // Source trapezoid as fractions of the input frame. The defaults assume a
-  // forward-facing camera mounted near the middle of the car; expect to tune
-  // horizon_y and top_half_width once you see the warped image.
-  double horizon_y = 0.62;         // top edge of the trapezoid
-  double bottom_y = 0.98;          // bottom edge
-  double top_half_width = 0.10;    // half-width at the horizon
-  double bottom_half_width = 0.52; // half-width at the bottom
-  int bev_size = 320;              // output is bev_size x bev_size
+    // --- birds eye warp ---
+    // the four corners of the road patch we care about, as fractions of the
+    // frame. expect to tune horizon_row once you see the warped picture
+    double horizon_row = 0.62;
+    double bottom_row = 0.98;
+    double half_width_at_horizon = 0.10;
+    double half_width_at_bottom = 0.52;
+    int warped_size_px = 320;
 
-  // --- lookahead band inside the BEV --------------------------------------
-  // 0.0 is the far edge, 1.0 is right at the bumper. Looking slightly ahead
-  // rather than at the bumper stops the steering oscillating.
-  double band_far = 0.20;
-  double band_near = 0.55;
+    // --- the band we look at ---
+    // 0.0 is far away, 1.0 is at the bumper. looking a little ahead instead of
+    // right at the bumper stops the steering wobbling
+    double band_far_edge = 0.20;
+    double band_near_edge = 0.55;
 
-  // --- run clustering -----------------------------------------------------
-  int min_column_hits = 2;    // a column needs this many lit pixels to count
-  int min_run_px = 3;         // narrower than this is noise
-  int merge_gap_px = 4;       // runs closer than this are one dashed marking
-  int max_line_run_px = 70;   // wider than this is surface, not a line
-  double min_lane_frac = 0.20;// two runs closer than this are the same marking
+    // --- grouping columns into markings ---
+    int min_white_per_column = 2;
+    int min_marking_width_px = 3;
+    int join_gap_px = 4;           // dashes closer than this count as one marking
+    int max_marking_width_px = 70; // wider than this is road surface
+    double min_lane_width_fraction = 0.20;
 };
 
 struct LaneResult {
-  bool found = false;          // false means do not steer on this frame
-  double lateral_error = 0.0;  // -1 fully left of centre, +1 fully right
-  LaneSource source = LaneSource::kNone;
-  double centre_x = -1.0;      // in BEV pixels
-  double left_x = -1.0;
-  double right_x = -1.0;
-  double lane_width = -1.0;
+    bool usable = false;          // false means dont steer on this frame
+    double offset_from_centre = 0.0;  // -1 lane is left of us, +1 lane is right
+    LaneSource source = LaneSource::NOTHING_FOUND;
+
+    double lane_centre_x = -1.0;  // all in warped pixels
+    double left_marking_x = -1.0;
+    double right_marking_x = -1.0;
+    double lane_width_px = -1.0;
 };
 
-namespace detail {
+// one stretch of neighbouring columns that all had white in them
+struct MarkingRun {
+    int start_column = 0;
+    int end_column = 0;    // one past the last
+    long white_pixels = 0;
 
-struct Run {
-  int begin = 0;
-  int end = 0;   // exclusive
-  long mass = 0;
-
-  int width() const { return end - begin; }
-  double centre() const { return 0.5 * (begin + end - 1); }
+    int width() const { return end_column - start_column; }
+    double centre() const { return 0.5 * (start_column + end_column - 1); }
 };
-
-}  // namespace detail
 
 class LaneFinder {
- public:
-  LaneFinder() = default;
-  explicit LaneFinder(const LaneParams& params) : params_(params) {}
+public:
+    LaneFinder() {}
+    explicit LaneFinder(const LaneSettings& settings) : settings_(settings) {}
 
-  LaneParams& params() { return params_; }
-  const LaneParams& params() const { return params_; }
+    LaneSettings& settings() { return settings_; }
 
-  // Forget the remembered lane geometry. Call this when the car is replaced
-  // in the world, or after a long stretch of lost frames, so a stale width
-  // from a different part of the track cannot mislead the one-line case.
-  void reset() {
-    lane_width_ = -1.0;
-    last_left_x_ = -1.0;
-    last_right_x_ = -1.0;
-    last_centre_x_ = -1.0;
-  }
-
-  const cv::Mat& mask() const { return mask_; }
-  const cv::Mat& bev() const { return bev_; }
-
-  LaneResult process(const cv::Mat& bgr) {
-    LaneResult result;
-    if (bgr.empty()) {
-      return result;
+    // forget the lane width we learned. call this when the car gets moved, or
+    // after a long run of bad frames, so an old width cant mislead us
+    void reset() {
+        remembered_lane_width_ = -1.0;
+        remembered_centre_x_ = -1.0;
     }
 
-    buildMask(bgr);
-    warpToBev();
-    const std::vector<detail::Run> runs = findRuns();
-    result = decide(runs);
-    remember(result);
-    return result;
-  }
+    const cv::Mat& warped_mask() const { return warped_mask_; }
 
-  // BEV with the decision drawn on it, for /vision/debug_image.
-  cv::Mat debugImage(const LaneResult& r) const {
-    if (bev_.empty()) {
-      return cv::Mat();
-    }
-    cv::Mat out;
-    cv::cvtColor(bev_, out, cv::COLOR_GRAY2BGR);
+    LaneResult process(const cv::Mat& camera_frame) {
+        LaneResult result;
+        if (camera_frame.empty()) return result;
 
-    const int h = out.rows;
-    const int y0 = static_cast<int>(params_.band_far * h);
-    const int y1 = static_cast<int>(params_.band_near * h);
-    cv::rectangle(out, cv::Point(0, y0), cv::Point(out.cols - 1, y1),
-                  cv::Scalar(60, 60, 60), 1);
+        build_mask(camera_frame);
+        warp_to_birds_eye();
 
-    const int mid = out.cols / 2;
-    cv::line(out, cv::Point(mid, 0), cv::Point(mid, h - 1), cv::Scalar(120, 120, 120), 1);
-
-    if (r.left_x >= 0) {
-      cv::line(out, cv::Point(static_cast<int>(r.left_x), y0),
-               cv::Point(static_cast<int>(r.left_x), y1), cv::Scalar(0, 180, 255), 2);
-    }
-    if (r.right_x >= 0) {
-      cv::line(out, cv::Point(static_cast<int>(r.right_x), y0),
-               cv::Point(static_cast<int>(r.right_x), y1), cv::Scalar(0, 180, 255), 2);
-    }
-    if (r.found && r.centre_x >= 0) {
-      cv::line(out, cv::Point(static_cast<int>(r.centre_x), y0),
-               cv::Point(static_cast<int>(r.centre_x), y1), cv::Scalar(0, 255, 0), 2);
+        std::vector<MarkingRun> runs = find_marking_runs();
+        result = work_out_centre(runs);
+        remember(result);
+        return result;
     }
 
-    cv::putText(out, cv::format("%s  err %+.2f", toString(r.source), r.lateral_error),
-                cv::Point(6, 18), cv::FONT_HERSHEY_SIMPLEX, 0.45,
-                r.found ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 140, 255), 1, cv::LINE_AA);
-    return out;
-  }
+    // the warped view with our decision drawn on it, for the debug topic
+    cv::Mat debug_picture(const LaneResult& result) const {
+        if (warped_mask_.empty()) return cv::Mat();
 
- private:
-  void buildMask(const cv::Mat& bgr) {
-    cv::Mat hls;
-    cv::cvtColor(bgr, hls, cv::COLOR_BGR2HLS);
-    // HLS channel order is H, L, S. Hue is left wide open on purpose: the
-    // markings are defined by being bright and colourless, not by a hue.
-    cv::inRange(hls,
-                cv::Scalar(0, params_.l_min, 0),
-                cv::Scalar(179, 255, params_.s_max),
-                mask_);
+        cv::Mat picture;
+        cv::cvtColor(warped_mask_, picture, cv::COLOR_GRAY2BGR);
 
-    if (params_.morph_open > 0) {
-      const cv::Mat k = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3));
-      cv::morphologyEx(mask_, mask_, cv::MORPH_OPEN, k, cv::Point(-1, -1),
-                       params_.morph_open);
-    }
-  }
+        int height = picture.rows;
+        int band_top = (int)(settings_.band_far_edge * height);
+        int band_bottom = (int)(settings_.band_near_edge * height);
 
-  void warpToBev() {
-    const double w = mask_.cols;
-    const double h = mask_.rows;
-    const double cx = 0.5 * w;
+        cv::rectangle(picture, cv::Point(0, band_top),
+                      cv::Point(picture.cols - 1, band_bottom),
+                      cv::Scalar(60, 60, 60), 1);
 
-    const cv::Point2f src[4] = {
-        cv::Point2f(static_cast<float>(cx - params_.top_half_width * w),
-                    static_cast<float>(params_.horizon_y * h)),
-        cv::Point2f(static_cast<float>(cx + params_.top_half_width * w),
-                    static_cast<float>(params_.horizon_y * h)),
-        cv::Point2f(static_cast<float>(cx + params_.bottom_half_width * w),
-                    static_cast<float>(params_.bottom_y * h)),
-        cv::Point2f(static_cast<float>(cx - params_.bottom_half_width * w),
-                    static_cast<float>(params_.bottom_y * h)),
-    };
+        int middle = picture.cols / 2;
+        cv::line(picture, cv::Point(middle, 0), cv::Point(middle, height - 1),
+                 cv::Scalar(120, 120, 120), 1);
 
-    const float s = static_cast<float>(params_.bev_size);
-    const cv::Point2f dst[4] = {
-        cv::Point2f(0.0f, 0.0f),
-        cv::Point2f(s - 1.0f, 0.0f),
-        cv::Point2f(s - 1.0f, s - 1.0f),
-        cv::Point2f(0.0f, s - 1.0f),
-    };
+        if (result.left_marking_x >= 0)
+            draw_vertical(picture, result.left_marking_x, band_top, band_bottom,
+                          cv::Scalar(0, 180, 255));
+        if (result.right_marking_x >= 0)
+            draw_vertical(picture, result.right_marking_x, band_top, band_bottom,
+                          cv::Scalar(0, 180, 255));
+        if (result.usable && result.lane_centre_x >= 0)
+            draw_vertical(picture, result.lane_centre_x, band_top, band_bottom,
+                          cv::Scalar(0, 255, 0));
 
-    const cv::Mat m = cv::getPerspectiveTransform(src, dst);
-    cv::warpPerspective(mask_, bev_, m, cv::Size(params_.bev_size, params_.bev_size),
-                        cv::INTER_NEAREST, cv::BORDER_CONSTANT, cv::Scalar(0));
-  }
-
-  // Column-wise hit counts inside the lookahead band, grouped into runs of
-  // adjacent lit columns.
-  std::vector<detail::Run> findRuns() const {
-    std::vector<detail::Run> runs;
-    if (bev_.empty()) {
-      return runs;
+        cv::putText(picture,
+                    cv::format("%s  offset %+.2f", lane_source_name(result.source),
+                               result.offset_from_centre),
+                    cv::Point(6, 18), cv::FONT_HERSHEY_SIMPLEX, 0.45,
+                    result.usable ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 140, 255),
+                    1, cv::LINE_AA);
+        return picture;
     }
 
-    const int h = bev_.rows;
-    const int w = bev_.cols;
-    const int y0 = std::clamp(static_cast<int>(params_.band_far * h), 0, h - 1);
-    const int y1 = std::clamp(static_cast<int>(params_.band_near * h), y0 + 1, h);
+private:
+    static void draw_vertical(cv::Mat& picture, double x, int top, int bottom,
+                              cv::Scalar colour) {
+        cv::line(picture, cv::Point((int)x, top), cv::Point((int)x, bottom), colour, 2);
+    }
 
-    std::vector<int> profile(static_cast<std::size_t>(w), 0);
-    for (int y = y0; y < y1; ++y) {
-      const unsigned char* row = bev_.ptr<unsigned char>(y);
-      for (int x = 0; x < w; ++x) {
-        if (row[x] != 0) {
-          ++profile[static_cast<std::size_t>(x)];
+    void build_mask(const cv::Mat& camera_frame) {
+        cv::Mat hls;
+        cv::cvtColor(camera_frame, hls, cv::COLOR_BGR2HLS);
+
+        // channels are hue, lightness, saturation in that order. hue is left
+        // wide open because the markings are defined by being bright and
+        // colourless, not by any particular colour
+        cv::inRange(hls,
+                    cv::Scalar(0, settings_.min_lightness, 0),
+                    cv::Scalar(179, 255, settings_.max_saturation),
+                    mask_);
+
+        if (settings_.despeckle_passes > 0) {
+            cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3));
+            cv::morphologyEx(mask_, mask_, cv::MORPH_OPEN, kernel,
+                             cv::Point(-1, -1), settings_.despeckle_passes);
         }
-      }
     }
 
-    // Walk the profile, opening a run on the first lit column and closing it
-    // after merge_gap_px dark columns, so a dashed line stays one run.
-    int begin = -1;
-    int gap = 0;
-    long mass = 0;
+    void warp_to_birds_eye() {
+        double frame_width = mask_.cols;
+        double frame_height = mask_.rows;
+        double middle_x = 0.5 * frame_width;
 
-    for (int x = 0; x < w; ++x) {
-      const bool lit = profile[static_cast<std::size_t>(x)] >= params_.min_column_hits;
-      if (lit) {
-        if (begin < 0) {
-          begin = x;
-          mass = 0;
+        cv::Point2f road_corners[4] = {
+            cv::Point2f((float)(middle_x - settings_.half_width_at_horizon * frame_width),
+                        (float)(settings_.horizon_row * frame_height)),
+            cv::Point2f((float)(middle_x + settings_.half_width_at_horizon * frame_width),
+                        (float)(settings_.horizon_row * frame_height)),
+            cv::Point2f((float)(middle_x + settings_.half_width_at_bottom * frame_width),
+                        (float)(settings_.bottom_row * frame_height)),
+            cv::Point2f((float)(middle_x - settings_.half_width_at_bottom * frame_width),
+                        (float)(settings_.bottom_row * frame_height))
+        };
+
+        float side = (float)settings_.warped_size_px;
+        cv::Point2f square_corners[4] = {
+            cv::Point2f(0.0f, 0.0f),
+            cv::Point2f(side - 1.0f, 0.0f),
+            cv::Point2f(side - 1.0f, side - 1.0f),
+            cv::Point2f(0.0f, side - 1.0f)
+        };
+
+        cv::Mat warp_matrix = cv::getPerspectiveTransform(road_corners, square_corners);
+        cv::warpPerspective(mask_, warped_mask_, warp_matrix,
+                            cv::Size(settings_.warped_size_px, settings_.warped_size_px),
+                            cv::INTER_NEAREST, cv::BORDER_CONSTANT, cv::Scalar(0));
+    }
+
+    std::vector<MarkingRun> find_marking_runs() const {
+        std::vector<MarkingRun> runs;
+        if (warped_mask_.empty()) return runs;
+
+        int height = warped_mask_.rows;
+        int width = warped_mask_.cols;
+        int band_top = (int)(settings_.band_far_edge * height);
+        int band_bottom = (int)(settings_.band_near_edge * height);
+        if (band_top < 0) band_top = 0;
+        if (band_bottom > height) band_bottom = height;
+
+        // how many white pixels each column has inside the band
+        std::vector<int> white_per_column(width, 0);
+        for (int row = band_top; row < band_bottom; row++) {
+            const unsigned char* pixels = warped_mask_.ptr<unsigned char>(row);
+            for (int column = 0; column < width; column++) {
+                if (pixels[column] != 0) white_per_column[column]++;
+            }
         }
-        gap = 0;
-        mass += profile[static_cast<std::size_t>(x)];
-      } else if (begin >= 0) {
-        ++gap;
-        if (gap > params_.merge_gap_px) {
-          const int end = x - gap + 1;
-          if (end - begin >= params_.min_run_px) {
-            runs.push_back({begin, end, mass});
-          }
-          begin = -1;
-          gap = 0;
-          mass = 0;
+
+        // walk left to right, open a run on the first white column and close it
+        // after enough dark ones, so a dashed line stays a single run
+        int run_start = -1;
+        int dark_columns = 0;
+        long run_pixels = 0;
+
+        for (int column = 0; column < width; column++) {
+            bool is_marking = white_per_column[column] >= settings_.min_white_per_column;
+
+            if (is_marking) {
+                if (run_start < 0) {
+                    run_start = column;
+                    run_pixels = 0;
+                }
+                dark_columns = 0;
+                run_pixels += white_per_column[column];
+            } else if (run_start >= 0) {
+                dark_columns++;
+                if (dark_columns > settings_.join_gap_px) {
+                    int run_end = column - dark_columns + 1;
+                    if (run_end - run_start >= settings_.min_marking_width_px) {
+                        MarkingRun run;
+                        run.start_column = run_start;
+                        run.end_column = run_end;
+                        run.white_pixels = run_pixels;
+                        runs.push_back(run);
+                    }
+                    run_start = -1;
+                    dark_columns = 0;
+                    run_pixels = 0;
+                }
+            }
         }
-      }
-    }
-    if (begin >= 0) {
-      const int end = w - gap;
-      if (end - begin >= params_.min_run_px) {
-        runs.push_back({begin, end, mass});
-      }
-    }
-    return runs;
-  }
 
-  LaneResult decide(const std::vector<detail::Run>& runs) {
-    LaneResult r;
-    const double w = static_cast<double>(params_.bev_size);
-    const double half = 0.5 * w;
-
-    if (runs.empty()) {
-      r.source = LaneSource::kNone;
-      return r;
-    }
-
-    // A single very wide blob is the road surface rather than a marking —
-    // some tracks are a light slab on dark ground. Its middle is the centre.
-    if (runs.size() == 1 && runs.front().width() > params_.max_line_run_px) {
-      r.source = LaneSource::kSurface;
-      r.found = true;
-      r.centre_x = runs.front().centre();
-      r.lateral_error = clampErr((r.centre_x - half) / half);
-      return r;
-    }
-
-    // Pick the two heaviest runs that are far enough apart to be the two
-    // sides of a lane. Sorting by mass, not width, keeps a long solid line
-    // ahead of a short bright speck.
-    std::vector<detail::Run> sorted = runs;
-    std::sort(sorted.begin(), sorted.end(),
-              [](const detail::Run& a, const detail::Run& b) { return a.mass > b.mass; });
-
-    const double min_sep = params_.min_lane_frac * w;
-    for (std::size_t i = 0; i < sorted.size(); ++i) {
-      for (std::size_t j = i + 1; j < sorted.size(); ++j) {
-        const double a = sorted[i].centre();
-        const double b = sorted[j].centre();
-        if (std::fabs(a - b) >= min_sep) {
-          r.left_x = std::min(a, b);
-          r.right_x = std::max(a, b);
-          r.centre_x = 0.5 * (r.left_x + r.right_x);
-          r.lane_width = r.right_x - r.left_x;
-          r.source = LaneSource::kTwoLines;
-          r.found = true;
-          r.lateral_error = clampErr((r.centre_x - half) / half);
-          return r;
+        if (run_start >= 0) {
+            int run_end = width - dark_columns;
+            if (run_end - run_start >= settings_.min_marking_width_px) {
+                MarkingRun run;
+                run.start_column = run_start;
+                run.end_column = run_end;
+                run.white_pixels = run_pixels;
+                runs.push_back(run);
+            }
         }
-      }
+        return runs;
     }
 
-    // Only one marking is usable. Which side of the car is it on? With a
-    // remembered width and a remembered position we can tell; without them
-    // we genuinely cannot, and guessing would steer the car off the road.
-    const double x = sorted.front().centre();
+    LaneResult work_out_centre(const std::vector<MarkingRun>& runs) {
+        LaneResult result;
+        double warped_width = (double)settings_.warped_size_px;
+        double half_warped = 0.5 * warped_width;
 
-    if (lane_width_ > 0.0 && last_centre_x_ >= 0.0) {
-      const bool is_left = x < last_centre_x_;
-      if (is_left) {
-        r.left_x = x;
-        r.centre_x = x + 0.5 * lane_width_;
-      } else {
-        r.right_x = x;
-        r.centre_x = x - 0.5 * lane_width_;
-      }
-      r.lane_width = lane_width_;
-      r.source = LaneSource::kOneLine;
-      r.found = true;
-      r.lateral_error = clampErr((r.centre_x - half) / half);
-      return r;
+        if (runs.empty()) {
+            result.source = LaneSource::NOTHING_FOUND;
+            return result;
+        }
+
+        // one very wide blob is the road slab itself, not a painted line.
+        // its middle is the centre
+        if (runs.size() == 1 && runs[0].width() > settings_.max_marking_width_px) {
+            result.source = LaneSource::ROAD_SURFACE;
+            result.usable = true;
+            result.lane_centre_x = runs[0].centre();
+            result.offset_from_centre = clamp_offset((result.lane_centre_x - half_warped) / half_warped);
+            return result;
+        }
+
+        // look for two runs far enough apart to be the two sides of a lane.
+        // sort by pixel count so a long solid line beats a bright speck
+        std::vector<MarkingRun> biggest_first = runs;
+        std::sort(biggest_first.begin(), biggest_first.end(),
+                  [](const MarkingRun& a, const MarkingRun& b) {
+                      return a.white_pixels > b.white_pixels;
+                  });
+
+        double min_separation = settings_.min_lane_width_fraction * warped_width;
+
+        for (size_t i = 0; i < biggest_first.size(); i++) {
+            for (size_t j = i + 1; j < biggest_first.size(); j++) {
+                double one_centre = biggest_first[i].centre();
+                double other_centre = biggest_first[j].centre();
+
+                if (fabs(one_centre - other_centre) >= min_separation) {
+                    result.left_marking_x = std::min(one_centre, other_centre);
+                    result.right_marking_x = std::max(one_centre, other_centre);
+                    result.lane_centre_x = 0.5 * (result.left_marking_x + result.right_marking_x);
+                    result.lane_width_px = result.right_marking_x - result.left_marking_x;
+                    result.source = LaneSource::BOTH_MARKINGS;
+                    result.usable = true;
+                    result.offset_from_centre =
+                        clamp_offset((result.lane_centre_x - half_warped) / half_warped);
+                    return result;
+                }
+            }
+        }
+
+        // only one marking is usable. which side of the car is it on? if we
+        // remember the lane width and roughly where the centre was, we can
+        // work it out. if we dont, there is genuinely no way to tell, and
+        // guessing would steer the car off the road
+        double only_marking_x = biggest_first[0].centre();
+
+        if (remembered_lane_width_ > 0.0 && remembered_centre_x_ >= 0.0) {
+            bool marking_is_on_our_left = only_marking_x < remembered_centre_x_;
+
+            if (marking_is_on_our_left) {
+                result.left_marking_x = only_marking_x;
+                result.lane_centre_x = only_marking_x + 0.5 * remembered_lane_width_;
+            } else {
+                result.right_marking_x = only_marking_x;
+                result.lane_centre_x = only_marking_x - 0.5 * remembered_lane_width_;
+            }
+
+            result.lane_width_px = remembered_lane_width_;
+            result.source = LaneSource::ONE_MARKING;
+            result.usable = true;
+            result.offset_from_centre =
+                clamp_offset((result.lane_centre_x - half_warped) / half_warped);
+            return result;
+        }
+
+        result.source = LaneSource::CANT_TELL;
+        result.lane_centre_x = only_marking_x;
+        return result;
     }
 
-    r.source = LaneSource::kAmbiguous;
-    r.centre_x = x;
-    return r;
-  }
-
-  void remember(const LaneResult& r) {
-    if (r.source == LaneSource::kTwoLines) {
-      lane_width_ = r.lane_width;
-      last_left_x_ = r.left_x;
-      last_right_x_ = r.right_x;
-      last_centre_x_ = r.centre_x;
-    } else if (r.found && r.centre_x >= 0.0) {
-      // Let the centre drift with the one-line and surface cases, but never
-      // overwrite the width from them — it was not measured on this frame.
-      last_centre_x_ = r.centre_x;
+    void remember(const LaneResult& result) {
+        if (result.source == LaneSource::BOTH_MARKINGS) {
+            remembered_lane_width_ = result.lane_width_px;
+            remembered_centre_x_ = result.lane_centre_x;
+        } else if (result.usable && result.lane_centre_x >= 0.0) {
+            // let the centre drift along, but never overwrite the width from
+            // these cases since we didnt actually measure it this frame
+            remembered_centre_x_ = result.lane_centre_x;
+        }
     }
-  }
 
-  static double clampErr(double v) { return std::clamp(v, -1.0, 1.0); }
+    static double clamp_offset(double offset) {
+        if (offset < -1.0) return -1.0;
+        if (offset >  1.0) return  1.0;
+        return offset;
+    }
 
-  LaneParams params_{};
-  cv::Mat mask_;
-  cv::Mat bev_;
+    LaneSettings settings_;
+    cv::Mat mask_;
+    cv::Mat warped_mask_;
 
-  double lane_width_ = -1.0;
-  double last_left_x_ = -1.0;
-  double last_right_x_ = -1.0;
-  double last_centre_x_ = -1.0;
+    double remembered_lane_width_ = -1.0;
+    double remembered_centre_x_ = -1.0;
 };
 
 }  // namespace vision
 
-#endif  // VISION_LANE_FINDER_HPP
+#endif
