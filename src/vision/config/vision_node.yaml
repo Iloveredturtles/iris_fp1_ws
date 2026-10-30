@@ -1,0 +1,29 @@
+/vision_node:
+  ros__parameters:
+    band_far_edge: 0.4
+    band_near_edge: 0.98
+    bottom_row: 0.88
+    despeckle_passes: 2
+    half_width_at_bottom: 0.95
+    half_width_at_horizon: 0.35
+    horizon_row: 0.72
+    image_topic: /catvehicle/camera_front/image_raw_front
+    join_gap_px: 4
+    max_marking_width_px: 70
+    max_saturation: 90
+    min_lane_width_fraction: 0.2
+    min_lightness: 170
+    min_marking_width_px: 3
+    min_white_per_column: 2
+    publish_debug: true
+    qos_overrides:
+      /parameter_events:
+        publisher:
+          depth: 1000
+          durability: volatile
+          history: keep_last
+          reliability: reliable
+    start_type_description_service: true
+    use_sim_time: false
+    warped_size_px: 320
+

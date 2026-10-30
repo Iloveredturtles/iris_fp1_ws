@@ -147,12 +147,21 @@ private:
                 pwm = master::throttle_for_steering(steering_deg, limits_.max_steering_deg,
                                                     limits_.max_pwm, limits_.min_pwm);
             } else {
-                // no usable lane. coast on the steering we already had rather
-                // than snapping the wheels straight, which would drive us out
-                // of whatever bend we are in
-                pwm = 0.0;
-                RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
-                                     "no usable lane, coasting");
+                // no usable lane. if we were already turning hard then we are
+                // probably mid corner and the road has swung out of the
+                // cameras view, so hold the turn in and crawl round until the
+                // markings come back. if we were going roughly straight we
+                // have no idea whats happening, so stop
+                if (fabs(last_steering_deg_) > 10.0) {
+                    pwm = limits_.min_pwm;
+                    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
+                                         "lost the lane mid corner, holding %.1f deg",
+                                         last_steering_deg_);
+                } else {
+                    pwm = 0.0;
+                    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
+                                         "no usable lane, stopping");
+                }
             }
         }
 

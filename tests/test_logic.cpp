@@ -251,6 +251,22 @@ void test_lane_finder() {
     CHECK(result.source == vision::LaneSource::ONE_MARKING);
     CHECK_NEAR(result.offset_from_centre, 0.0, 0.05);
 
+    section("lane finder, wont guess a side it cant tell");
+    // the marking sits almost exactly where we last saw the lane centre, so
+    // which side of the car it is on is a coin flip. getting it wrong puts
+    // the centre a FULL LANE out and steers the car off the road, so it has
+    // to refuse. this one cost a corner before it was caught
+    finder.process(white_stripes({160, 480}));          // centre at BEV ~159
+    result = finder.process(white_stripes({320}));      // marking at BEV ~159
+    CHECK(!result.usable);
+    CHECK(result.source == vision::LaneSource::CANT_TELL);
+
+    // and just outside the margin it is willing again
+    finder.process(white_stripes({160, 480}));
+    result = finder.process(white_stripes({420}));      // BEV ~209, clear of centre
+    CHECK(result.usable);
+    CHECK(result.source == vision::LaneSource::ONE_MARKING);
+
     section("lane finder, refuses to guess");
     // one marking and no memory. nothing in the picture says which side of the
     // car it is on, so usable must be false and master_node coasts

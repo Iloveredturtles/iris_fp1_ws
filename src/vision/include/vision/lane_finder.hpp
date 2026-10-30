@@ -72,6 +72,11 @@ struct LaneSettings {
     int join_gap_px = 4;           // dashes closer than this count as one marking
     int max_marking_width_px = 70; // wider than this is road surface
     double min_lane_width_fraction = 0.20;
+
+    // with one marking showing, how far it must sit from the remembered
+    // centre before we trust which side of the car it is on, as a fraction
+    // of the lane width. below this we say we cant tell instead of guessing
+    double side_decision_margin = 0.25;
 };
 
 struct LaneResult {
@@ -340,6 +345,22 @@ private:
         double only_marking_x = biggest_first[0].centre();
 
         if (remembered_lane_width_ > 0.0 && remembered_centre_x_ >= 0.0) {
+            // how far the marking sits from where we last saw the centre.
+            // if it is close to that line the side decision is a coin flip,
+            // and getting it wrong puts the lane centre a FULL LANE out: at
+            // the exact tipping point, two pixels either way swings the
+            // answer from hard left to hard right. so demand a clear margin
+            // and give up rather than guess
+            double distance_from_centre = fabs(only_marking_x - remembered_centre_x_);
+            double confident_margin = settings_.side_decision_margin
+                                    * remembered_lane_width_;
+
+            if (distance_from_centre < confident_margin) {
+                result.source = LaneSource::CANT_TELL;
+                result.lane_centre_x = only_marking_x;
+                return result;
+            }
+
             bool marking_is_on_our_left = only_marking_x < remembered_centre_x_;
 
             if (marking_is_on_our_left) {
@@ -364,12 +385,16 @@ private:
     }
 
     void remember(const LaneResult& result) {
+        // only ever remember what we actually measured, which means frames
+        // where both markings were visible.
+        //
+        // the earlier version also updated the centre from one marking
+        // frames, and that was a real bug: the side we picked was based on
+        // the remembered centre, so our own guess became the basis for the
+        // next guess. on a corner the centre walked further off every frame
+        // until the car was being steered away from the road
         if (result.source == LaneSource::BOTH_MARKINGS) {
             remembered_lane_width_ = result.lane_width_px;
-            remembered_centre_x_ = result.lane_centre_x;
-        } else if (result.usable && result.lane_centre_x >= 0.0) {
-            // let the centre drift along, but never overwrite the width from
-            // these cases since we didnt actually measure it this frame
             remembered_centre_x_ = result.lane_centre_x;
         }
     }
